@@ -1,466 +1,478 @@
+#!/usr/bin/env python3
 """
-Детектор ценников на видео.
+Парсер ценников → CSV
+Текст распознаётся локальной нейросетью через Ollama (Qwen2.5-VL).
+QR-коды и штрих-коды читает pyzbar (без сети, без ключей).
 
-Зоны ценника:
-  БЕЛАЯ ЗОНА (верх):
-    ├─ Левые 55%  → product_name  (тёмный текст на белом)
-    ├─ Правые 45% → QR-код        (декодируется pyzbar)
-    │    ├─ верх QR              → сам QR
-    │    └─ низ  (~30%)          → price_default (цена без карты, напр. 368)
-  КРАСНАЯ ЗОНА (низ):
-    ├─ Левые 28%  → discount_amount + мелкий текст (дата, id_sku)
-    ├─ 28–78%    → price_card    (белый текст, крупные цифры)
-    └─ Правые 22% → штрихкод     (pyzbar + OCR цифр под ним)
+═══════════════════════════════════════════════════════
+ УСТАНОВКА (один раз)
+═══════════════════════════════════════════════════════
 
-QR содержит данные через разделитель — парсим price1_qr…price4_qr.
-Дедупликация: трекинг bbox по IOU, запись при уходе ценника из кадра.
+1. Ollama:
+   Linux/macOS:  curl -fsSL https://ollama.ai/install.sh | sh
+   Windows:      https://ollama.ai/download
+
+2. Скачать модель:
+   ollama pull qwen2.5vl:7b        # ~5 GB — рекомендуется
+   ollama pull qwen2.5vl:3b        # ~2.5 GB — если мало RAM/VRAM
+
+3. Python-зависимости:
+   pip install opencv-python-headless pillow pyzbar numpy requests
+
+4. pyzbar системная либа:
+   Ubuntu/Debian:  sudo apt install libzbar0
+   macOS:          brew install zbar
+   Windows:        pip install pyzbar  (dll идёт в комплекте)
+
+═══════════════════════════════════════════════════════
+ ИСПОЛЬЗОВАНИЕ
+═══════════════════════════════════════════════════════
+   # Ollama должна быть запущена: ollama serve
+   python detect.py ./папка_с_ценниками
+   python detect.py ./папка -o result.csv
+   python detect.py img1.jpg img2.png -o result.csv
+
+   # Другая модель:
+   python detect.py ./папка --model qwen2.5vl:3b
+
+   # Другой адрес Ollama (если не localhost):
+   python detect.py ./папка --host http://192.168.1.10:11434
 """
 
-import cv2, csv, re, os, time
+import os
+import re
+import csv
+import sys
+import json
+import base64
+import argparse
+from pathlib import Path
+from io import BytesIO
+
+import cv2
 import numpy as np
-import pytesseract
-from ultralytics import YOLO
-from dataclasses import dataclass, field
+import requests
+from PIL import Image
 
 try:
-    from pyzbar import pyzbar as _pyzbar
-    def decode_codes(img): return [c.data.decode("utf-8","ignore") for c in _pyzbar.decode(img)]
+    from pyzbar.pyzbar import decode as pyzbar_decode
+    HAS_PYZBAR = True
 except ImportError:
-    print("⚠ pyzbar не установлен — QR/штрихкод не будет декодирован")
-    def decode_codes(img): return []
+    HAS_PYZBAR = False
+    print("[!] pyzbar не найден — QR и штрих-коды не будут читаться.")
+    print("    pip install pyzbar   |   Ubuntu: sudo apt install libzbar0\n")
 
-# ══════════════════════════ НАСТРОЙКИ ═════════════════════════════════════════
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# ── Настройки ────────────────────────────────────────────────────────────────
+# ИСПРАВЛЕНО: заменили llava:7b → qwen2.5vl:7b (намного лучше читает русский текст и OCR)
+DEFAULT_MODEL = "qwen2.5vl:3b-q4_K_M"
+DEFAULT_HOST  = "http://localhost:11434"
 
-VIDEO_PATH  = "test.mp4"
-OUTPUT_CSV  = "results.csv"
-YOLO_MODEL  = "runs/detect/train-2/weights/best.pt"
-CONF_THRESH = 0.5
-FRAME_SKIP  = 5
-ROTATION    = cv2.ROTATE_90_COUNTERCLOCKWISE   # 270° по часовой
-
-UPSCALE_WHITE   = 2.0
-UPSCALE_PRICE   = 2.0
-UPSCALE_DISC    = 5.0
-UPSCALE_BARCODE = 8.0
-UPSCALE_QR      = 4.0
-UPSCALE_SMALL   = 7.0   # для мелкого текста (дата, id_sku)
-
-IOU_THRESHOLD  = 0.45
-CONFIRM_FRAMES = 10
-MAX_MISS       = 30
-# ══════════════════════════════════════════════════════════════════════════════
-
-CSV_FIELDS = [
-    "filename","product_name","price_default","price_card","price_discount",
-    "barcode","discount_amount","id_sku","print_datetime","code",
-    "additional_info","color","special_symbols","frame_timestamp",
-    "x_min","y_min","x_max","y_max",
-    "qr_code_barcode","price1_qr","price2_qr","price3_qr","price4_qr",
-    "wholesale_level_1_count","wholesale_level_1_price",
-    "wholesale_level_2_count","wholesale_level_2_price",
-    "action_price_qr","action_code_qr",
+# ── Колонки CSV ───────────────────────────────────────────────────────────────
+CSV_COLUMNS = [
+    "filename", "product_name", "price_default", "price_card", "price_discount",
+    "barcode", "discount_amount", "id_sku", "print_datetime", "code",
+    "additional_info", "color", "special_symbols", "frame_timestamp",
+    "x_min", "y_min", "x_max", "y_max",
+    "qr_code_barcode", "price1_qr", "price2_qr", "price3_qr", "price4_qr",
+    "wholesale_level_1_count", "wholesale_level_1_price",
+    "wholesale_level_2_count", "wholesale_level_2_price",
+    "action_price_qr", "action_code_qr",
 ]
 
-# ──────────────────────── УТИЛИТЫ ─────────────────────────────────────────────
+SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff", ".tif"}
 
-def _up(img, factor):
+# ── Промпт для модели ─────────────────────────────────────────────────────────
+PROMPT = """Ты — OCR-система для российских магазинных ценников. Внимательно прочитай все надписи на ценнике и верни строго JSON-объект.
+
+Извлеки следующие поля:
+{
+  "product_name": "полное название товара с весом/объёмом и страной в скобках",
+  "price_default": "цена без карты лояльности — число с точкой, например 72.59",
+  "price_card": "цена по карте лояльности — число с точкой, например 55.39",
+  "price_discount": "акционная или оптовая цена если есть — число с точкой",
+  "discount_amount": "размер скидки строкой, например -23%",
+  "id_sku": "артикул или SKU под штрих-кодом",
+  "print_datetime": "дата и время печати как на ценнике, например 24.12.2025 12:25",
+  "code": "код зоны полки если есть, например 01_025019 - 026015",
+  "additional_info": "дополнительная информация: тип вина Сухое, номер весов и т.п.",
+  "special_symbols": "буква Ш если есть символ шелфтокера",
+  "wholesale_level_1_count": "минимальное количество для оптовой цены 1",
+  "wholesale_level_1_price": "оптовая цена 1 — число с точкой",
+  "wholesale_level_2_count": "минимальное количество для оптовой цены 2",
+  "wholesale_level_2_price": "оптовая цена 2 — число с точкой"
+}
+
+Правила:
+- Цены ТОЛЬКО числа с точкой: 72.59, а не 72,59 и не «72 рублей»
+- Для отсутствующих полей используй null
+- Не придумывай данные которых нет на ценнике
+- Верни ТОЛЬКО JSON-объект, без пояснений, без markdown, без ```"""
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЯ
+# ════════════════════════════════════════════════════════════════════════════
+
+def upscale_if_small(img: np.ndarray, min_dim: int = 800) -> np.ndarray:
+    """Увеличиваем маленькие изображения для лучшего OCR."""
     h, w = img.shape[:2]
-    return cv2.resize(img, (int(w*factor), int(h*factor)), interpolation=cv2.INTER_CUBIC)
+    if min(h, w) < min_dim:
+        scale = min_dim / min(h, w)
+        img = cv2.resize(img, None, fx=scale, fy=scale,
+                         interpolation=cv2.INTER_CUBIC)
+    return img
 
-def _pad(b):
-    return cv2.copyMakeBorder(b, 10,10,10,10, cv2.BORDER_CONSTANT, value=255)
 
-def _otsu_black_on_white(img_bgr, scale):
-    up   = _up(img_bgr, scale)
-    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
-    _, b = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if np.mean(b) < 127: b = cv2.bitwise_not(b)
-    return b
+def img_to_base64(img_bgr: np.ndarray) -> str:
+    """Конвертируем numpy-изображение в base64 JPEG для Ollama."""
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb)
+    buf = BytesIO()
+    pil.save(buf, format="JPEG", quality=92)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-def _clahe_adap(img_bgr, scale, block=15, c=6):
-    """CLAHE + адаптивный порог — лучше для мелкого текста на цветном фоне."""
-    up   = _up(img_bgr, scale)
-    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-    cl   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4,4))
-    gray = cl.apply(gray)
-    b    = cv2.adaptiveThreshold(gray, 255,
-                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY, block, c)
-    if np.mean(b) < 127: b = cv2.bitwise_not(b)
-    return b
 
-def _red_zone_white_text(img_bgr, scale):
-    """R - max(G,B): выделяет белый текст на красном фоне."""
-    up = _up(img_bgr, scale)
-    b, g, r = cv2.split(up.astype(np.int16))
-    sig  = np.clip(r - np.maximum(g, b), 0, 255).astype(np.uint8)
-    inv  = cv2.bitwise_not(sig)
-    _, b = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    k2   = cv2.getStructuringElement(cv2.MORPH_RECT, (2,2))
-    b    = cv2.morphologyEx(b, cv2.MORPH_CLOSE, k2, iterations=1)
-    return cv2.bitwise_not(b)
+# ════════════════════════════════════════════════════════════════════════════
+#  OLLAMA
+# ════════════════════════════════════════════════════════════════════════════
 
-def _trim_red_edges(img):
-    """Обрезает чёрные скруглённые углы по HSV красной маске."""
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    m   = cv2.bitwise_or(cv2.inRange(hsv,(0,80,80),(10,255,255)),
-                         cv2.inRange(hsv,(160,80,80),(180,255,255)))
-    col = m.sum(axis=0)/(img.shape[0]*255)
-    row = m.sum(axis=1)/(img.shape[1]*255)
-    cs  = next((i for i,v in enumerate(col) if v>0.2), 0)
-    ce  = next((i for i,v in enumerate(reversed(col)) if v>0.2), 0)
-    rs  = next((i for i,v in enumerate(row) if v>0.2), 0)
-    re_ = next((i for i,v in enumerate(reversed(row)) if v>0.2), 0)
-    h,w = img.shape[:2]
-    return img[rs: h-re_ if re_ else h, cs: w-ce if ce else w]
+def check_ollama(host: str, model: str):
+    """Проверяем что Ollama запущена и модель доступна."""
+    try:
+        r = requests.get(f"{host}/api/tags", timeout=5)
+        r.raise_for_status()
+        available = [m["name"] for m in r.json().get("models", [])]
+    except requests.exceptions.ConnectionError:
+        print(f"\n❌ Ollama не запущена на {host}")
+        print("   Запустите: ollama serve")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Ошибка подключения к Ollama: {e}")
+        sys.exit(1)
 
-def _split_zones(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    m   = cv2.bitwise_or(cv2.inRange(hsv,(0,80,80),(10,255,255)),
-                         cv2.inRange(hsv,(160,80,80),(180,255,255)))
-    ratio = m.sum(axis=1)/(img.shape[1]*255)
-    split = next((i for i,r in enumerate(ratio) if r>0.30), None)
-    if split is None: return img, None
-    if split < 5:     return None, img
-    return img[:split], img[split:]
+    # Сначала точное совпадение, потом по базовому имени
+    exact_match = model in available
+    model_base = model.split(":")[0]
+    partial_match = [m for m in available if m.startswith(model_base)]
 
-# ──────────────────────── OCR ─────────────────────────────────────────────────
+    if not exact_match and not partial_match:
+        print(f"\n❌ Модель '{model}' не найдена.")
+        print(f"   Доступные: {available if available else 'нет моделей'}")
+        print(f"   Скачайте:  ollama pull {model}")
+        sys.exit(1)
 
-def _ocr(img_proc, cfg, min_h=60):
-    if img_proc.shape[0] < min_h:
-        s = min_h/img_proc.shape[0]
-        img_proc = cv2.resize(img_proc, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
-    data = pytesseract.image_to_data(img_proc, lang="rus+eng", config=cfg,
-                                     output_type=pytesseract.Output.DICT)
-    words = [(t.strip(), c) for t,c in zip(data["text"],data["conf"])
-             if t.strip() and c > 0]
-    text = " ".join(w for w,_ in words)
-    conf = float(np.mean([c for _,c in words])) if words else 0.0
-    return text, conf
+    # Если точного совпадения нет — автоматически берём первую подходящую
+    if not exact_match and partial_match:
+        actual_model = partial_match[0]
+        print(f"  ⚠️  Модель '{model}' не найдена точно, использую '{actual_model}'")
+        # Подменяем модель глобально через возврат
+        return actual_model
 
-CFG_BLOCK = "--oem 3 --psm 6"
-CFG_LINE  = "--oem 3 --psm 7"
-CFG_DIGIT = "--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789."
+    print(f"  Ollama: {host}  |  Модель: {model}  ✓")
 
-# ──────────────────────── ПАРСИНГ ─────────────────────────────────────────────
 
-def _price(text):
-    m = re.search(r"\d[\d\s]*[.,]\d{2}", text)
-    if m: return m.group().replace(" ","").replace(",",".")
-    m = re.search(r"\d{2,}", text)
-    return m.group() if m else ""
-
-def _discount(text):
-    m = re.search(r"-?\d+\s*%", text)
-    return m.group().replace(" ","") if m else ""
-
-def _digits_only(text):
-    return re.sub(r"[^\d]","", text)
-
-def _parse_qr(raw: str) -> dict:
+def extract_json_from_text(text: str) -> str:
     """
-    QR на ценниках Ленты содержит данные через разделители.
-    Формат примерно: barcode|price1|price2||price_card|...
-    Пробуем несколько разделителей.
+    Надёжно вытаскиваем JSON из ответа модели.
+    Убираем markdown-обёртки, ищем первый полный {...}.
     """
-    result = {"qr_code_barcode": raw, "price1_qr":"","price2_qr":"",
-              "price3_qr":"","price4_qr":"","action_price_qr":"нет",
-              "action_code_qr":"нет"}
-    # Ищем числовые поля — цены и штрихкод
-    parts = re.split(r"[|;\t]", raw)
-    prices = []
-    barcode = ""
-    for p in parts:
-        p = p.strip()
-        if re.fullmatch(r"\d{8,13}", p):
-            barcode = p
-        elif re.fullmatch(r"\d+[.,]\d{2}", p):
-            prices.append(p.replace(",","."))
-    if barcode:
-        result["qr_code_barcode"] = barcode
-    for i, pr in enumerate(prices[:4]):
-        result[f"price{i+1}_qr"] = pr
-    return result
+    # Убираем markdown-блоки ```json ... ```
+    text = re.sub(r"```(?:json)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+    text = text.strip()
 
-# ──────────────────────── ОБРАБОТКА КРОПА ─────────────────────────────────────
+    # Ищем JSON-объект — берём самый длинный найденный блок
+    # (защита от случаев когда модель добавляет текст после JSON)
+    best = None
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = text[start:i + 1]
+                if best is None or len(candidate) > len(best):
+                    best = candidate
+    return best or ""
 
-def process_crop(crop: np.ndarray) -> dict:
-    r = {f:"" for f in CSV_FIELDS}
-    r.update({"code":"нет","additional_info":"нет","color":"red",
-               "special_symbols":"нет","wholesale_level_1_count":"нет",
-               "wholesale_level_1_price":"нет","wholesale_level_2_count":"нет",
-               "wholesale_level_2_price":"нет","action_price_qr":"нет",
-               "action_code_qr":"нет"})
-    confs = []
 
-    white, red = _split_zones(crop)
+def call_ollama(host: str, model: str, img_b64: str) -> dict:
+    """
+    Отправляем изображение в Ollama, получаем JSON с полями ценника.
+    """
+    payload = {
+        "model": model,
+        "prompt": PROMPT,
+        "images": [img_b64],
+        "stream": False,
+        "options": {
+            "temperature": 0.0,
+            # ИСПРАВЛЕНО: было 600 — не хватало на полный JSON с русским текстом
+            "num_predict": 1500,
+            # ИСПРАВЛЕНО: убрали stop ["\n\n\n"] — он обрывал JSON раньше времени
+        }
+    }
 
-    # ── БЕЛАЯ ЗОНА ──────────────────────────────────────────────────────────
-    if white is not None and white.shape[0] >= 10:
-        wh, ww = white.shape[:2]
+    r = requests.post(
+        f"{host}/api/generate",
+        json=payload,
+        timeout=300  # Qwen2.5-VL на CPU может быть медленнее llava
+    )
+    r.raise_for_status()
 
-        # Название товара — левые 55%
-        name_z = white[:, :int(ww*0.55)]
-        if name_z.shape[1] > 10:
-            proc = _otsu_black_on_white(name_z, UPSCALE_WHITE)
-            text, conf = _ocr(_pad(proc), CFG_BLOCK)
-            r["product_name"] = " ".join(text.split())
-            confs.append(conf)
+    raw = r.json().get("response", "").strip()
 
-        # QR зона — правые 45%
-        qr_z = white[:, int(ww*0.55):]
-        if qr_z.shape[1] > 10:
-            qzh, qzw = qr_z.shape[:2]
+    json_str = extract_json_from_text(raw)
+    if not json_str:
+        raise ValueError(f"JSON не найден в ответе модели: {raw[:300]}")
 
-            # QR-код — верхние 70%
-            qr_img = qr_z[:int(qzh*0.70), :]
-            proc_qr = _otsu_black_on_white(qr_img, UPSCALE_QR)
-            codes = decode_codes(proc_qr)
-            if not codes:
-                # Попробовать оригинал без обработки
-                codes = decode_codes(_up(qr_img, UPSCALE_QR))
-            if codes:
-                parsed = _parse_qr(codes[0])
-                r.update(parsed)
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        # Пробуем починить обрезанный JSON — добавляем закрывающую скобку
+        # (бывает если модель не уложилась в num_predict)
+        fixed = json_str.rstrip().rstrip(",") + "\n}"
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            raise ValueError(f"Не удалось распарсить JSON: {e}\nОтвет: {json_str[:300]}")
 
-            # price_default — нижние 30% правой зоны (цена без карты, напр. "368")
-            pd_z = qr_z[int(qzh*0.70):, :]
-            if pd_z.shape[0] > 4:
-                proc_pd = _otsu_black_on_white(pd_z, UPSCALE_SMALL)
-                text, conf = _ocr(_pad(proc_pd), CFG_DIGIT)
-                val = _price(text)
-                if val:
-                    r["price_default"] = val
-                    confs.append(conf)
 
-    # ── КРАСНАЯ ЗОНА ────────────────────────────────────────────────────────
-    if red is not None and red.shape[0] >= 10:
-        img = red[2:-2, 2:-2] if red.shape[0]>6 and red.shape[1]>6 else red
-        rh, rw = img.shape[:2]
+# ════════════════════════════════════════════════════════════════════════════
+#  QR И ШТРИХ-КОДЫ (pyzbar — работает без сети)
+# ════════════════════════════════════════════════════════════════════════════
 
-        # Скидка — левые 28%
-        disc_z = img[:, :int(rw*0.28)]
-        if disc_z.shape[1] > 10:
-            disc_t = _trim_red_edges(disc_z)
-            dh, dw = disc_t.shape[:2]
-
-            # Крупный текст скидки — верхние 42% (сам процент)
-            disc_top = disc_t[:int(dh*0.42), :]
-            if disc_top.shape[0] > 4:
-                proc = _otsu_black_on_white(disc_top, UPSCALE_DISC)
-                text, conf = _ocr(_pad(proc), CFG_LINE)
-                val = _discount(text)
-                if val:
-                    r["discount_amount"] = val
-                    confs.append(conf)
-
-            # Мелкий текст под скидкой — нижние 58% (дата печати, id_sku)
-            disc_bot = disc_t[int(dh*0.42):, :]
-            if disc_bot.shape[0] > 4:
-                proc = _clahe_adap(disc_bot, UPSCALE_SMALL, block=13, c=5)
-                text, conf = _ocr(_pad(proc), CFG_BLOCK)
-                # id_sku — длинное число
-                m_id = re.search(r"\d{10,}", text)
-                if m_id: r["id_sku"] = m_id.group()
-                # Дата — ищем ДД.ММ.ГГГГ или похожее
-                m_dt = re.search(r"\d{1,2}[./]\d{1,2}[./]\d{2,4}", text)
-                if m_dt: r["print_datetime"] = m_dt.group()
-                if conf > 0: confs.append(conf)
-
-        # Цена по карте — средние 28–78% (крупные белые цифры)
-        price_z = img[:, int(rw*0.28):int(rw*0.78)]
-        if price_z.shape[1] > 10:
-            proc = _red_zone_white_text(price_z, UPSCALE_PRICE)
-            text, conf = _ocr(_pad(proc), CFG_LINE)
-            val = _price(text)
-            if val:
-                r["price_card"] = val
-                confs.append(conf)
-
-        # Штрихкод — правые 22%
-        bar_z = img[:, int(rw*0.78):]
-        if bar_z.shape[1] > 8:
-            # 1) pyzbar на разных апскейлах
-            bar_found = ""
-            for sc in [UPSCALE_BARCODE, 6.0, 10.0]:
-                proc_b = _otsu_black_on_white(bar_z, sc)
-                codes  = decode_codes(proc_b)
-                if not codes:
-                    codes = decode_codes(_up(bar_z, sc))  # без бинаризации
-                if codes:
-                    bar_found = codes[0]
-                    break
-
-            # 2) Если pyzbar не взял — OCR цифр под штрихкодом
-            if not bar_found:
-                bzh = bar_z.shape[0]
-                digits_z = bar_z[int(bzh*0.65):, :]   # нижние 35% — цифры EAN
-                if digits_z.shape[0] > 3:
-                    proc_d = _clahe_adap(digits_z, UPSCALE_SMALL, block=11, c=4)
-                    text, _ = _ocr(_pad(proc_d), CFG_DIGIT)
-                    d = _digits_only(text)
-                    if len(d) >= 8:
-                        bar_found = d
-
-            if bar_found:
-                r["barcode"] = bar_found
-                if not r.get("qr_code_barcode"):
-                    r["qr_code_barcode"] = bar_found
-
-    r["_confidence"] = float(np.mean(confs)) if confs else 0.0
-    return r
-
-# ──────────────────────── ТРЕКЕР ──────────────────────────────────────────────
-
-@dataclass
-class Track:
-    bbox:         tuple  = (0,0,0,0)
-    detect_count: int    = 0
-    miss_count:   int    = 0
-    saved:        bool   = False
-    best_conf:    float  = 0.0
-    data:         dict   = field(default_factory=dict)
-
-def _iou(a, b):
-    ix1,iy1 = max(a[0],b[0]), max(a[1],b[1])
-    ix2,iy2 = min(a[2],b[2]), min(a[3],b[3])
-    inter = max(0,ix2-ix1)*max(0,iy2-iy1)
-    if not inter: return 0.0
-    aa = (a[2]-a[0])*(a[3]-a[1]); ab = (b[2]-b[0])*(b[3]-b[1])
-    return inter/(aa+ab-inter)
-
-class TagTracker:
-    def __init__(self): self._tracks: list[Track] = []
-
-    def update(self, detections, frame_idx, fps, video_name):
-        matched_t = set(); matched_d = set()
-        for di,(bbox,ocr) in enumerate(detections):
-            best_iou, best_ti = 0.0, -1
-            for ti,t in enumerate(self._tracks):
-                v = _iou(bbox, t.bbox)
-                if v > best_iou: best_iou,best_ti = v,ti
-            if best_iou >= IOU_THRESHOLD:
-                matched_t.add(best_ti); matched_d.add(di)
-                t = self._tracks[best_ti]
-                t.bbox = bbox; t.detect_count += 1; t.miss_count = 0
-                new_conf = ocr.pop("_confidence", 0.0)
-                if new_conf > t.best_conf:
-                    t.best_conf = new_conf
-                    # Обновляем только непустые поля
-                    for k,v in ocr.items():
-                        if v and v != "нет": t.data[k] = v
-            else:
-                d = dict(ocr)
-                conf = d.pop("_confidence", 0.0)
-                d["filename"] = video_name
-                d["frame_timestamp"] = f"{frame_idx/fps:.2f}s"
-                d["x_min"],d["y_min"],d["x_max"],d["y_max"] = bbox
-                t = Track(bbox=bbox, detect_count=1, best_conf=conf, data=d)
-                self._tracks.append(t)
-
-        for ti,t in enumerate(self._tracks):
-            if ti not in matched_t: t.miss_count += 1
-
-        to_save, alive = [], []
-        for t in self._tracks:
-            if t.miss_count > MAX_MISS:
-                if t.detect_count >= CONFIRM_FRAMES and not t.saved:
-                    to_save.append(t); t.saved = True
-            else:
-                alive.append(t)
-        self._tracks = alive
-        return to_save
-
-    def flush(self):
-        result = []
-        for t in self._tracks:
-            if t.detect_count >= CONFIRM_FRAMES and not t.saved:
-                result.append(t); t.saved = True
+def decode_codes(img_bgr: np.ndarray) -> dict:
+    result = {"qr_data": [], "barcodes": []}
+    if not HAS_PYZBAR:
         return result
 
-# ──────────────────────── MAIN ────────────────────────────────────────────────
+    for src in [img_bgr, cv2.bitwise_not(img_bgr)]:
+        decoded = pyzbar_decode(src)
+        if decoded:
+            for obj in decoded:
+                raw = obj.data.decode("utf-8", errors="ignore").strip()
+                if obj.type == "QRCODE":
+                    if raw not in result["qr_data"]:
+                        result["qr_data"].append(raw)
+                else:
+                    if raw not in result["barcodes"]:
+                        result["barcodes"].append(raw)
+            break
 
-def _row(track: Track, video_name: str) -> dict:
-    row = {f:"" for f in CSV_FIELDS}
-    row.update({"code":"нет","additional_info":"нет","color":"red",
-                "special_symbols":"нет","wholesale_level_1_count":"нет",
-                "wholesale_level_1_price":"нет","wholesale_level_2_count":"нет",
-                "wholesale_level_2_price":"нет","action_price_qr":"нет",
-                "action_code_qr":"нет"})
-    row.update(track.data)
-    row["filename"] = video_name
+    return result
+
+
+def parse_qr_content(qr_strings: list) -> dict:
+    """Парсим данные внутри QR-кода: штрих-код и цены."""
+    out = {
+        "qr_code_barcode": "нет",
+        "price1_qr": "нет", "price2_qr": "нет",
+        "price3_qr": "нет", "price4_qr": "нет",
+        "action_price_qr": "нет", "action_code_qr": "нет",
+    }
+    if not qr_strings:
+        return out
+
+    raw = qr_strings[0]
+
+    # Пробуем JSON
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            out["qr_code_barcode"] = str(data.get("barcode", data.get("ean", "нет")))
+            for i, p in enumerate(data.get("prices", [])[:4], 1):
+                out[f"price{i}_qr"] = str(p)
+            return out
+    except Exception:
+        pass
+
+    # Разделители | ; ,
+    parts = re.split(r"[|;,]", raw)
+    prices_found, barcode_found = [], None
+    for p in parts:
+        p = p.strip()
+        if re.fullmatch(r"\d{8,18}", p):
+            barcode_found = p
+        elif re.fullmatch(r"\d{1,6}[.,]\d{2}", p):
+            prices_found.append(p.replace(",", "."))
+
+    if barcode_found:
+        out["qr_code_barcode"] = barcode_found
+    elif re.fullmatch(r"\d{8,18}", raw):
+        out["qr_code_barcode"] = raw
+
+    for i, pr in enumerate(prices_found[:4], 1):
+        out[f"price{i}_qr"] = pr
+
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ЦВЕТ РАМКИ
+# ════════════════════════════════════════════════════════════════════════════
+
+def detect_frame_color(img: np.ndarray) -> str:
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    border = np.concatenate([
+        hsv[:20, :].reshape(-1, 3), hsv[-20:, :].reshape(-1, 3),
+        hsv[:, :20].reshape(-1, 3), hsv[:, -20:].reshape(-1, 3),
+    ])
+    h = float(np.median(border[:, 0]))
+    s = float(np.median(border[:, 1]))
+    v = float(np.median(border[:, 2]))
+
+    if s < 40:
+        return "white" if v > 128 else "нет"
+    if h < 15 or h > 165: return "red"
+    if 15 <= h < 35:       return "yellow"
+    if 35 <= h < 85:       return "green"
+    if 85 <= h < 130:      return "blue"
+    return "нет"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  СБОРКА СТРОКИ CSV
+# ════════════════════════════════════════════════════════════════════════════
+
+def build_row(filename: str, llm_data: dict, qr_fields: dict,
+              barcode_scanner: str, color: str) -> dict:
+    """Собираем финальную строку CSV из всех источников."""
+    row = {col: "нет" for col in CSV_COLUMNS}
+    row["filename"] = filename
+
+    # Поля от нейросети
+    llm_fields = {
+        "product_name", "price_default", "price_card", "price_discount",
+        "discount_amount", "id_sku", "print_datetime", "code",
+        "additional_info", "special_symbols",
+        "wholesale_level_1_count", "wholesale_level_1_price",
+        "wholesale_level_2_count", "wholesale_level_2_price",
+    }
+    for key in llm_fields:
+        val = llm_data.get(key)
+        if val is not None and str(val).lower() not in ("null", "none", ""):
+            row[key] = str(val)
+
+    # Штрих-код: физический сканер приоритетнее OCR
+    if barcode_scanner:
+        row["barcode"] = barcode_scanner
+    elif llm_data.get("barcode"):
+        row["barcode"] = str(llm_data["barcode"])
+
+    # QR-данные
+    row.update(qr_fields)
+
+    # Если штрих-код только в QR
+    if row["barcode"] == "нет" and qr_fields["qr_code_barcode"] != "нет":
+        row["barcode"] = qr_fields["qr_code_barcode"]
+
+    row["color"] = color
+
+    for k in ("frame_timestamp", "x_min", "y_min", "x_max", "y_max"):
+        row[k] = "нет"
+
     return row
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  ОБРАБОТКА ОДНОГО ФАЙЛА
+# ════════════════════════════════════════════════════════════════════════════
+
+def process_image(img_path: Path, host: str, model: str) -> dict:
+    img = cv2.imread(str(img_path))
+    if img is None:
+        raise ValueError("Не удалось прочитать файл")
+
+    img = upscale_if_small(img)
+
+    # 1. QR и штрих-коды (pyzbar — быстро, без сети)
+    codes = decode_codes(img)
+    barcode_scanner = codes["barcodes"][0] if codes["barcodes"] else None
+    qr_fields = parse_qr_content(codes["qr_data"])
+
+    # 2. Нейросеть читает текст
+    img_b64 = img_to_base64(img)
+    llm_data = call_ollama(host, model, img_b64)
+
+    # 3. Цвет рамки
+    color = detect_frame_color(img)
+
+    # 4. Собираем строку
+    return build_row(img_path.name, llm_data, qr_fields, barcode_scanner, color)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ════════════════════════════════════════════════════════════════════════════
+
+def collect_images(inputs: list) -> list:
+    images = []
+    for inp in inputs:
+        p = Path(inp)
+        if p.is_dir():
+            for f in sorted(p.iterdir()):
+                if f.suffix.lower() in SUPPORTED_EXT:
+                    images.append(f)
+        elif p.is_file() and p.suffix.lower() in SUPPORTED_EXT:
+            images.append(p)
+        else:
+            print(f"  [!] Пропускаю: {inp}")
+    seen = set()
+    return [x for x in images if not (x in seen or seen.add(x))]
+
+
 def main():
-    cap = cv2.VideoCapture(VIDEO_PATH)
-    if not cap.isOpened():
-        print(f"❌ Не удалось открыть {VIDEO_PATH}"); return
+    parser = argparse.ArgumentParser(
+        description="Парсер ценников: изображения → CSV (Ollama + Qwen2.5-VL)"
+    )
+    parser.add_argument("inputs", nargs="+",
+                        help="Папка с изображениями или отдельные файлы")
+    parser.add_argument("-o", "--output", default="output.csv",
+                        help="Выходной CSV (по умолчанию: output.csv)")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help=f"Модель Ollama (по умолчанию: {DEFAULT_MODEL})")
+    parser.add_argument("--host", default=DEFAULT_HOST,
+                        help=f"Адрес Ollama (по умолчанию: {DEFAULT_HOST})")
+    args = parser.parse_args()
 
-    fps        = cap.get(cv2.CAP_PROP_FPS) or 25
-    model      = YOLO(YOLO_MODEL)
-    tracker    = TagTracker()
-    video_name = os.path.basename(VIDEO_PATH)
-    frame_idx  = 0
+    images = collect_images(args.inputs)
+    if not images:
+        print("Ошибка: изображения не найдены.")
+        sys.exit(1)
 
-    out = open(OUTPUT_CSV, "w", newline="", encoding="utf-8-sig")
-    writer = csv.DictWriter(out, fieldnames=CSV_FIELDS)
-    writer.writeheader()
+    print(f"\nНайдено изображений: {len(images)}")
+    check_ollama(args.host, args.model)
+    print(f"Выходной файл: {args.output}")
+    print("⚠️  На CPU каждый ценник занимает ~60-180 сек (qwen2.5vl:7b)\n")
 
-    print(f"▶ {VIDEO_PATH}  FPS={fps:.1f}  skip={FRAME_SKIP}")
-    t0 = time.time()
+    rows, errors = [], []
+    for i, img_path in enumerate(images, 1):
+        print(f"  [{i}/{len(images)}] {img_path.name} ...", end=" ", flush=True)
+        try:
+            row = process_image(img_path, args.host, args.model)
+            rows.append(row)
+            print("✓")
+        except json.JSONDecodeError as e:
+            print(f"✗  (модель вернула не JSON: {e})")
+            errors.append(img_path.name)
+        except Exception as e:
+            print(f"✗  ({e})")
+            errors.append(img_path.name)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        frame_idx += 1
-        frame = cv2.rotate(frame, ROTATION)
+    with open(args.output, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
-        if frame_idx % FRAME_SKIP != 0: continue
+    print(f"\n✅ Записано строк: {len(rows)} → {args.output}")
+    if errors:
+        print(f"⚠️  Ошибки ({len(errors)}): {', '.join(errors)}")
 
-        results = model(frame, conf=CONF_THRESH, verbose=False)
-        detections = []
-        fh, fw = frame.shape[:2]
-
-        for box in results[0].boxes:
-            x1,y1,x2,y2 = map(int, box.xyxy[0].tolist())
-            x1=max(0,x1-5); y1=max(0,y1-5)
-            x2=min(fw,x2+5); y2=min(fh,y2+5)
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0: continue
-
-            ocr = process_crop(crop)
-            ocr["x_min"]=x1; ocr["y_min"]=y1
-            ocr["x_max"]=x2; ocr["y_max"]=y2
-            ocr["frame_timestamp"] = f"{frame_idx/fps:.2f}s"
-            detections.append(((x1,y1,x2,y2), ocr))
-
-            cv2.rectangle(frame,(x1,y1),(x2,y2),(0,200,0),2)
-            lbl = ocr.get("price_card") or ocr.get("price_default") or "?"
-            cv2.putText(frame, lbl, (x1, y1-8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,200,0), 2)
-
-        ready = tracker.update(detections, frame_idx, fps, video_name)
-        for t in ready:
-            row = _row(t, video_name)
-            writer.writerow(row)
-            print(f"  ✅ {row['product_name'][:40] or '?'} | "
-                  f"цена={row['price_card']} | без карты={row['price_default']} | "
-                  f"скидка={row['discount_amount']} | barcode={row['barcode']} | "
-                  f"QR={row['qr_code_barcode'][:20] if row['qr_code_barcode'] else ''}")
-
-        cv2.imshow("Price Tag Detector",
-                   cv2.resize(frame, None, fx=0.6, fy=0.6))
-        if cv2.waitKey(1) & 0xFF == ord("q"): break
-
-    for t in tracker.flush():
-        row = _row(t, video_name)
-        writer.writerow(row)
-
-    elapsed = time.time()-t0
-    out.close(); cap.release(); cv2.destroyAllWindows()
-    print(f"\n✔ Готово за {elapsed:.1f}с → {OUTPUT_CSV}")
 
 if __name__ == "__main__":
     main()
