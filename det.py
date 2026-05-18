@@ -73,7 +73,7 @@ except ImportError:
     print("    pip install pyzbar   |   Ubuntu: sudo apt install libzbar0\n")
 
 # ── Настройки ─────────────────────────────────────────────────────────────────
-DEFAULT_MODEL = "qwen2.5vl:3b-q4_K_M"
+DEFAULT_MODEL = "qwen2.5vl:7b"
 DEFAULT_HOST  = "http://localhost:11434"
 EXAMPLES_DIR  = Path(__file__).parent / "examples"
 
@@ -530,6 +530,31 @@ def classify_tag(host: str, model: str, img_b64: str) -> str:
     return "standard"  # fallback на самый частый тип
 
 
+NULLED_FIELDS = {
+    "product_name", "price_default", "price_card", "price_discount",
+    "discount_amount", "barcode", "id_sku", "print_datetime", "code",
+    "additional_info", "special_symbols",
+    "wholesale_level_1_count", "wholesale_level_1_price",
+    "wholesale_level_2_count", "wholesale_level_2_price",
+}
+
+def _is_full_copy(result: dict, example: dict) -> bool:
+    """Возвращает True если ВСЕ ненулевые поля результата совпадают с примером."""
+    compared = 0
+    matched = 0
+    for key in NULLED_FIELDS:
+        ex_val = example.get(key)
+        res_val = result.get(key)
+        if ex_val is None:
+            continue
+        compared += 1
+        if str(res_val).strip() == str(ex_val).strip():
+            matched += 1
+    if compared == 0:
+        return False
+    return matched == compared
+
+
 def extract_fields(host: str, model: str, img_b64: str, tag_type: str) -> dict:
     """Шаг 2: извлекаем поля специализированным промптом."""
     base_prompt = PROMPTS[tag_type]
@@ -540,7 +565,12 @@ def extract_fields(host: str, model: str, img_b64: str, tag_type: str) -> dict:
         example_json = json.dumps(ex["json"], ensure_ascii=False, indent=2)
         prompt = (
             f"{ex['desc']}\n{example_json}\n\n"
-            f"Now apply the SAME logic to the NEW price tag below.\n\n"
+            f"⚠️ WARNING: The JSON above shows the OUTPUT FORMAT only. "
+            f"All values in it are FICTIONAL and belong to a DIFFERENT price tag.\n"
+            f"Do NOT copy any value from the example into your answer.\n"
+            f"Extract ONLY what you can literally read from the NEW image.\n"
+            f"If you cannot read a field → set it to null.\n\n"
+            f"Now extract data from the NEW price tag below.\n\n"
             f"{base_prompt}"
         )
         images = [example_img, img_b64]
@@ -554,13 +584,21 @@ def extract_fields(host: str, model: str, img_b64: str, tag_type: str) -> dict:
         raise ValueError(f"JSON не найден в ответе: {raw[:300]}")
 
     try:
-        return json.loads(json_str)
+        parsed = json.loads(json_str)
     except json.JSONDecodeError as e:
         fixed = json_str.rstrip().rstrip(",") + "\n}"
         try:
-            return json.loads(fixed)
+            parsed = json.loads(fixed)
         except json.JSONDecodeError:
             raise ValueError(f"Не удалось распарсить JSON: {e}\n{json_str[:300]}")
+
+    # Если модель скопировала все значения из примера — обнуляем всё
+    if example_img and _is_full_copy(parsed, FEW_SHOT_EXAMPLES[tag_type]["json"]):
+        print("  [!] Обнаружено полное копирование примера → все поля = null")
+        for key in NULLED_FIELDS:
+            parsed[key] = None
+
+    return parsed
 
 
 # ════════════════════════════════════════════════════════════════════════════
