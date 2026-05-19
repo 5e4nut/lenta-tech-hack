@@ -173,7 +173,7 @@ class DeduplicationManager:
 
 def rotate_90cw(frame: np.ndarray) -> np.ndarray:
     """Повернуть кадр на 90° по часовой стрелке (компенсация монтажа камеры)."""
-    return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
 def bbox_fully_visible(x1: int, y1: int, x2: int, y2: int,
@@ -374,12 +374,14 @@ def run(args):
                     model=resolved_model,
                     frame_timestamp=video_time,
                     bbox=(x1, y1, x2, y2),
+                    video_name=args.input.name,
+                    frame_index=frame_idx,
                 )
                 csv_writer.writerow(row)
                 csv_file.flush()
                 csv_written += 1
                 session_processed.add(tid)
-                print(f"    → {row.get('tag_type','?')}  '{row.get('product_name','')[:50]}'  "
+                print(f"    → {row.get('_tag_type','?')}  '{row.get('product_name','')[:50]}'  "
                       f"({time.time()-t0:.1f}s)  [CSV строк: {csv_written}]")
             except Exception as e:
                 print(f"    ✗ Ошибка обработки track#{tid}: {e}")
@@ -442,8 +444,8 @@ def parse_args():
                    help="Путь к .mp4 / .avi видеофайлу")
     p.add_argument("-o", "--output", type=Path, default=Path("video_tags.csv"),
                    help="Выходной CSV (по умолчанию: video_tags.csv)")
-    p.add_argument("--model", default="best.pt",
-                   help="Путь к YOLO-модели (по умолчанию: best.pt)")
+    p.add_argument("--model", default="runs/detect/train-2/weights/best.pt",
+                   help="Путь к YOLO-модели (по умолчанию: runs/detect/train-2/weights/best.pt)")
     p.add_argument("--ollama-model", default=det_module.DEFAULT_MODEL,
                    help=f"Модель Ollama (по умолчанию: {det_module.DEFAULT_MODEL})")
     p.add_argument("--ollama-host", default=det_module.DEFAULT_HOST,

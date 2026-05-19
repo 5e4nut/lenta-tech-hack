@@ -79,7 +79,7 @@ EXAMPLES_DIR  = Path(__file__).parent / "examples"
 
 # ── Колонки CSV ───────────────────────────────────────────────────────────────
 CSV_COLUMNS = [
-    "filename", "tag_type",
+    "filename",
     "product_name", "price_default", "price_card", "price_discount",
     "barcode", "discount_amount", "id_sku", "print_datetime", "code",
     "additional_info", "color", "special_symbols", "frame_timestamp",
@@ -504,8 +504,38 @@ def extract_json(text: str) -> str:
     return best or ""
 
 
+import time
+
+# ── Счётчик запросов и сброс модели ──────────────────────────────────────────
+_request_counter = 0
+RESET_EVERY_N    = 10        # сбрасывать модель каждые N запросов
+SLOW_THRESHOLD_S = 45        # если ответ дольше X сек — предупреждение
+
+
+def _unload_model(host: str, model: str) -> None:
+    """Выгружает модель из памяти Ollama (keep_alive=0), чтобы сбросить состояние."""
+    try:
+        requests.post(
+            f"{host}/api/generate",
+            json={"model": model, "keep_alive": 0},
+            timeout=30,
+        )
+        print(f"  [↺] Модель выгружена из памяти (сброс каждые {RESET_EVERY_N} запросов)")
+    except Exception as e:
+        print(f"  [!] Не удалось выгрузить модель: {e}")
+
+
 def call_ollama(host: str, model: str, prompt: str,
                 images: list, timeout: int = 600) -> str:
+    global _request_counter
+
+    # Сброс каждые RESET_EVERY_N запросов
+    if _request_counter > 0 and _request_counter % RESET_EVERY_N == 0:
+        _unload_model(host, model)
+        time.sleep(2)  # дать время на выгрузку
+
+    _request_counter += 1
+
     payload = {
         "model": model,
         "prompt": prompt,
@@ -513,7 +543,14 @@ def call_ollama(host: str, model: str, prompt: str,
         "stream": False,
         "options": {"temperature": 0.0, "num_predict": 700},
     }
+
+    t0 = time.time()
     r = requests.post(f"{host}/api/generate", json=payload, timeout=timeout)
+    elapsed = time.time() - t0
+
+    if elapsed > SLOW_THRESHOLD_S:
+        print(f"  [⚠] Медленный ответ: {elapsed:.1f}s (порог {SLOW_THRESHOLD_S}s) — возможна деградация")
+
     r.raise_for_status()
     return r.json().get("response", "").strip()
 
@@ -686,7 +723,9 @@ def build_row(filename: str, tag_type: str, llm_data: dict,
               qr_fields: dict, barcode_scanner: str, color: str) -> dict:
     row = {col: "нет" for col in CSV_COLUMNS}
     row["filename"] = filename
-    row["tag_type"] = tag_type
+    # tag_type не входит в CSV_COLUMNS (убран из эталона), но сохраняем
+    # во внутреннем ключе чтобы process_image мог его логировать
+    row["_tag_type"] = tag_type
 
     for key in {
         "product_name", "price_default", "price_card", "price_discount",
@@ -709,8 +748,7 @@ def build_row(filename: str, tag_type: str, llm_data: dict,
         row["barcode"] = qr_fields["qr_code_barcode"]
 
     row["color"] = color
-    for k in ("frame_timestamp", "x_min", "y_min", "x_max", "y_max"):
-        row[k] = "нет"
+    # frame_timestamp, x_min..y_max заполняются снаружи (в process_numpy_frame)
     return row
 
 
@@ -752,6 +790,8 @@ def process_numpy_frame(
     model: str = DEFAULT_MODEL,
     frame_timestamp: float = 0.0,
     bbox: tuple = None,
+    video_name: str = None,
+    frame_index: int = None,
 ) -> dict:
     """
     Обработать crop ценника, переданный как numpy BGR array (из video_detect.py).
@@ -759,11 +799,13 @@ def process_numpy_frame(
     Параметры
     ----------
     img              : BGR numpy array (уже вырезанный crop ценника)
-    frame_filename   : имя для поля filename в CSV (например "frame_00123_track7")
+    frame_filename   : используется только для логирования (например "frame_00123_track7")
     host             : адрес Ollama
     model            : модель Ollama
-    frame_timestamp  : время кадра в секундах с начала видео
-    bbox             : (x_min, y_min, x_max, y_max) координаты в оригинальном кадре
+    frame_timestamp  : время кадра в секундах (для обратной совместимости, не пишется в CSV)
+    bbox             : (x_min, y_min, x_max, y_max) координаты float в оригинальном кадре
+    video_name       : имя видеофайла — пишется в колонку filename (например "26_12-20.mp4")
+    frame_index      : номер кадра — пишется в колонку frame_timestamp
     """
     img = upscale_if_small(img)
 
@@ -776,13 +818,21 @@ def process_numpy_frame(
     llm_data = extract_fields(host, model, img_b64, tag_type)
 
     color = detect_frame_color(img)
-    row = build_row(frame_filename, tag_type, llm_data, qr_fields, barcode_scanner, color)
 
-    row["frame_timestamp"] = f"{frame_timestamp:.2f}"
+    # filename в CSV = имя видеофайла, а не имя кадра
+    csv_filename = video_name if video_name else frame_filename
+    row = build_row(csv_filename, tag_type, llm_data, qr_fields, barcode_scanner, color)
+
+    # frame_timestamp в эталоне = номер кадра (целое число)
+    row["frame_timestamp"] = str(frame_index) if frame_index is not None else str(int(round(frame_timestamp * 30)))
+
+    # bbox пишем как float с 1 знаком после запятой (формат эталона: 2011.9)
     if bbox:
-        row["x_min"], row["y_min"], row["x_max"], row["y_max"] = (
-            str(bbox[0]), str(bbox[1]), str(bbox[2]), str(bbox[3])
-        )
+        row["x_min"] = f"{float(bbox[0]):.1f}"
+        row["y_min"] = f"{float(bbox[1]):.1f}"
+        row["x_max"] = f"{float(bbox[2]):.1f}"
+        row["y_max"] = f"{float(bbox[3]):.1f}"
+
     return row
 
 
